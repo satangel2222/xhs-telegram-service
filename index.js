@@ -1,5 +1,5 @@
-// --- Final Version v1.9 ---
-console.log("Starting server v1.9, handling POST on root path '/'...");
+// --- Final Version v2.0 ---
+console.log("Starting server v2.0, handling POST on '/api/send'...");
 
 const express = require('express');
 const cors = require('cors');
@@ -7,7 +7,7 @@ const axios = require('axios');
 
 const app = express();
 
-// --- 中间件 ---
+// --- Middlewares ---
 app.use((req, res, next) => {
   console.log(`Request received: ${req.method} ${req.originalUrl}`);
   next();
@@ -17,26 +17,26 @@ const corsOptions = {
   origin: 'https://www.xiaohongshu.com',
   methods: 'POST, GET, OPTIONS',
   allowedHeaders: 'Content-Type, Authorization',
-  optionsSuccessStatus: 200 
+  optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// --- 路由 ---
+// --- Routes ---
+// Explicitly handle OPTIONS for the new path
+app.options('/api/send', cors(corsOptions));
 
-// 核心POST路由现在监听根路径'/'
-app.post('/', async (req, res) => {
-  console.log("Request processing started for POST '/'. Title:", req.body.title);
+// Core POST route now listens on '/api/send'
+app.post('/api/send', async (req, res) => {
+  console.log("Request processing started for '/api/send'. Title:", req.body.title);
   
   const { noteUrl, title, author, files } = req.body;
-
   if (!files || !Array.isArray(files) || files.length === 0) {
     return res.status(400).json({ ok: false, message: 'No files to process.' });
   }
 
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const channelId = process.env.TELEGRAM_CHANNEL_ID;
-
   if (!botToken || !channelId) {
     return res.status(500).json({ ok: false, message: 'Server environment variables not configured.' });
   }
@@ -63,13 +63,13 @@ app.post('/', async (req, res) => {
       throw new Error(response.data.description);
     }
   } catch (error) {
-    console.error('Error in root POST handler:', error.response ? error.response.data : error.message);
+    console.error("Error in '/api/send' handler:", error.response ? error.response.data : error.message);
     res.status(500).json({ ok: false, message: `Failed to send to Telegram: ${error.message}` });
   }
 });
 
-// --- 服务器启动 ---
+// --- Server Start ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server v1.9 is listening on port ${PORT}`);
+  console.log(`Server v2.0 is listening on port ${PORT}`);
 });
