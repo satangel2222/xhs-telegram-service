@@ -1,16 +1,12 @@
 {
-  "name": "xhs-telegram-service",
-  "version": "1.0.0",
-  "description": "Relay service for XHS to Telegram",
+  "name": "media2tg-backend",
+  "version": "2.2.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "author": "",
-  "license": "ISC",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "axios": "^1.7.2",
+    "axios": "^1.7.7",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "form-data": "^4.0.0"
   }
 }
