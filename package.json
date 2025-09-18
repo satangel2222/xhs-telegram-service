@@ -1,7 +1,6 @@
 {
   "name": "media2tg-backend",
   "version": "2.2.0",
-  "type": "module",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
