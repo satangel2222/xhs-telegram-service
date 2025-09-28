@@ -1,5 +1,5 @@
-// --- Media2TG Backend v2.2 (robust single/group + fallbacks) ---
-console.log("Booting Media2TG backend v2.2 ...");
+// --- Media2TG Backend v2.3 (main + routed channels, tag-only caption) ---
+console.log("Booting Media2TG backend v2.3 ...");
 
 const express = require('express');
 const cors = require('cors');
@@ -12,7 +12,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use((req, _res, next) => { console.log(`[REQ] ${req.method} ${req.originalUrl}`); next(); });
 
-// 宽松 CORS（Tampermonkey 实际不受同源限制，但便于你直接用浏览器调试）
+// 宽松 CORS（方便浏览器直测；Tampermonkey不依赖同源）
 app.use(cors({
   origin: true,
   methods: 'POST,GET,OPTIONS',
@@ -20,11 +20,17 @@ app.use(cors({
   optionsSuccessStatus: 200
 }));
 
-// -------- Helpers ----------
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID   = process.env.TELEGRAM_CHANNEL_ID;
-const TG_API    = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
+// -------- Env ----------
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;         // 你之前就有
+const CHAT_ID_MAIN = process.env.TELEGRAM_CHANNEL_ID;     // 主频道：@Xxhs1234（沿用旧名）
 
+// 新增两个（请到 Render > Environment 里新增）
+const ROUTE_CHAT_XHS    = process.env.ROUTE_CHAT_XHS || '@xhsgallery';
+const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || '@mybigbreastgal';
+
+const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
+
+// -------- Utils ----------
 function escHtml(s='') {
   return String(s)
     .replace(/&/g,'&amp;')
@@ -43,6 +49,23 @@ function buildCaptionHTML({ title, author, noteUrl, pageUrl, source }) {
   return cap;
 }
 
+function tagBySource(source='') {
+  const s = (source || '').toLowerCase();
+  if (s === 'xhs') return '#小红书';
+  if (s === 'instagram') return '#Instagram';
+  if (s === 'x') return '#Twitter';
+  if (s === 'redgifs') return '#Redgifs';
+  if (s === 'tiktok') return '#TikTok';
+  if (s === 'douyin') return '#抖音';
+  return '#Unknown';
+}
+
+function routeChatBySource(source='') {
+  const s = (source || '').toLowerCase();
+  if (s === 'xhs') return ROUTE_CHAT_XHS;
+  return ROUTE_CHAT_OTHERS;
+}
+
 function chunk(arr, size) {
   const out = [];
   for (let i=0; i<arr.length; i+=size) out.push(arr.slice(i, i+size));
@@ -50,7 +73,6 @@ function chunk(arr, size) {
 }
 
 function mediaToKind(file) {
-  // file: {url,type}  type: 'video' | 'photo'
   return (file && file.type === 'video') ? 'video' : 'photo';
 }
 
@@ -60,15 +82,17 @@ function tgErrInfo(e) {
   return String(e);
 }
 
-// -------- Telegram Senders ----------
-async function tgSendSingle(file, captionHTML) {
+// -------- Telegram Senders (支持指定 chat_id) ----------
+async function tgSendSingleTo(chatId, file, caption, useHTML) {
   const kind = mediaToKind(file);
   const endpoint = kind === 'video' ? 'sendVideo' : 'sendPhoto';
   const payload = {
-    chat_id: CHAT_ID,
-    caption: captionHTML,
-    parse_mode: 'HTML'
+    chat_id: chatId
   };
+  if (caption) {
+    payload.caption = caption;
+    if (useHTML) payload.parse_mode = 'HTML';
+  }
   if (kind === 'video') {
     payload.video = file.url;
     payload.supports_streaming = true;
@@ -80,17 +104,17 @@ async function tgSendSingle(file, captionHTML) {
     const res = await axios.post(`${TG_API}/${endpoint}`, payload, { timeout: 60000 });
     return res.data;
   } catch (e) {
-    // 可能是 Telegram 无法直连该 URL，尝试下载转发（multipart）
+    // 回退：URL直链不可取时，改为multipart转发
     console.warn(`[TG] ${endpoint} by URL failed, fallback to multipart...`, tgErrInfo(e));
     try {
       const buf = await axios.get(file.url, { responseType: 'arraybuffer', timeout: 90000 }).then(r=>r.data);
       const fd = new FormData();
-      fd.append('chat_id', CHAT_ID);
-      fd.append('caption', captionHTML || '');
-      fd.append('parse_mode', 'HTML');
-
+      fd.append('chat_id', chatId);
+      if (caption) {
+        fd.append('caption', caption);
+        if (useHTML) fd.append('parse_mode', 'HTML');
+      }
       const field = (kind === 'video') ? 'video' : 'photo';
-      // 给个稳定文件名
       const filename = (kind === 'video') ? 'video.mp4' : 'image.jpg';
       fd.append(field, buf, { filename });
 
@@ -107,40 +131,39 @@ async function tgSendSingle(file, captionHTML) {
   }
 }
 
-async function tgSendGroup(files, captionHTML) {
-  // media group：2-10 个
+async function tgSendGroupTo(chatId, files, caption, useHTML) {
+  // 仅第一个元素带 caption/parse_mode
   const media = files.map((f, idx) => ({
     type: mediaToKind(f) === 'video' ? 'video' : 'photo',
     media: f.url,
-    caption: idx === 0 ? captionHTML : undefined,
-    parse_mode: idx === 0 ? 'HTML' : undefined
+    caption: (idx === 0 && caption) ? caption : undefined,
+    parse_mode: (idx === 0 && caption && useHTML) ? 'HTML' : undefined
   }));
 
   try {
     const res = await axios.post(`${TG_API}/sendMediaGroup`, {
-      chat_id: CHAT_ID,
+      chat_id: chatId,
       media
     }, { timeout: 90000 });
     return res.data;
   } catch (e) {
-    // 有时某些 URL 不可直取，退回为逐个发送
     console.warn('[TG] sendMediaGroup by URL failed, fallback to per-file...', tgErrInfo(e));
     const out = [];
     for (let i=0;i<files.length;i++) {
-      const cap = (i === 0) ? captionHTML : undefined;
-      out.push(await tgSendSingle(files[i], cap));
+      const cap = (i === 0) ? caption : undefined;
+      out.push(await tgSendSingleTo(chatId, files[i], cap, useHTML));
     }
     return { ok: true, results: out };
   }
 }
 
-// -------- Route ----------
+// -------- Routes ----------
 app.options('/api/send', cors());
 
 app.post('/api/send', async (req, res) => {
   const t0 = Date.now();
   try {
-    if (!BOT_TOKEN || !CHAT_ID) {
+    if (!BOT_TOKEN || !CHAT_ID_MAIN) {
       return res.status(500).json({ ok: false, message: 'Server env TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID missing.' });
     }
 
@@ -149,28 +172,44 @@ app.post('/api/send', async (req, res) => {
       return res.status(400).json({ ok: false, message: 'No files to process.' });
     }
 
-    const captionHTML = buildCaptionHTML({ title, author, noteUrl, pageUrl, source });
+    // 1) 主频道（保留原 caption 逻辑，HTML）
+    const captionMain = buildCaptionHTML({ title, author, noteUrl, pageUrl, source });
 
-    let okResp;
-    if (files.length === 1) {
-      okResp = await tgSendSingle(files[0], captionHTML);
-    } else {
-      // 2-10 一组，超过 10 分批
-      const groups = chunk(files, 10);
-      const results = [];
-      for (const g of groups) {
-        if (g.length === 1) {
-          results.push(await tgSendSingle(g[0], captionHTML));
-        } else {
-          results.push(await tgSendGroup(g, captionHTML));
-        }
+    let mainResp;
+    const groups = chunk(files, 10);
+    const mainResults = [];
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi];
+      if (g.length === 1) {
+        mainResults.push(await tgSendSingleTo(CHAT_ID_MAIN, g[0], gi === 0 ? captionMain : undefined, true));
+      } else {
+        mainResults.push(await tgSendGroupTo(CHAT_ID_MAIN, g, gi === 0 ? captionMain : undefined, true));
       }
-      okResp = { ok: true, groups: results };
+    }
+    mainResp = { ok: true, groups: mainResults };
+
+    // 2) 分类频道（仅平台标签 caption；不使用 HTML）
+    const routedChat = routeChatBySource(source);
+    const tagCaption = tagBySource(source);
+
+    const routedResults = [];
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi];
+      // 只有第一批第一项带标签，其余批次不带
+      if (g.length === 1) {
+        routedResults.push(await tgSendSingleTo(routedChat, g[0], gi === 0 ? tagCaption : undefined, false));
+      } else {
+        routedResults.push(await tgSendGroupTo(routedChat, g, gi === 0 ? tagCaption : undefined, false));
+      }
     }
 
     const ms = Date.now() - t0;
     console.log(`[OK] forwarded ${files.length} file(s) in ${ms}ms, title="${(title||'').slice(0,40)}"`);
-    return res.status(200).json({ ok: true, message: 'Successfully forwarded to Telegram.', data: okResp });
+    return res.status(200).json({
+      ok: true,
+      message: 'Successfully forwarded to main & routed channels.',
+      data: { main: mainResp, routed: routedResults }
+    });
   } catch (e) {
     const ms = Date.now() - t0;
     const info = tgErrInfo(e);
@@ -179,7 +218,7 @@ app.post('/api/send', async (req, res) => {
   }
 });
 
-// -------- Health & Start ----------
+// 健康检查
 app.get('/', (_req, res) => res.status(200).send('Media2TG backend is up.'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Media2TG backend listening on :${PORT}`));
