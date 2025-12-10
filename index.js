@@ -1,5 +1,5 @@
-// --- Media2TG Backend v2.3 (main + routed channels, tag-only caption) ---
-console.log("Booting Media2TG backend v2.3 ...");
+// --- Media2TG Backend v2.4 (main + routed channels, tag-only caption, large-file hook) ---
+console.log("Booting Media2TG backend v2.4 ...");
 
 const express = require('express');
 const cors = require('cors');
@@ -21,12 +21,18 @@ app.use(cors({
 }));
 
 // -------- Env ----------
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;         // 你之前就有
-const CHAT_ID_MAIN = process.env.TELEGRAM_CHANNEL_ID;     // 主频道：@Xxhs1234（沿用旧名）
 
-// 新增两个（请到 Render > Environment 里新增）
+// 你原来的 Bot 配置
+const BOT_TOKEN      = process.env.TELEGRAM_BOT_TOKEN;         // 你之前就有
+const CHAT_ID_MAIN   = process.env.TELEGRAM_CHANNEL_ID;        // 主频道：@Xxhs1234（沿用旧名）
+
+// 多频道路由：你原本就用的两个
 const ROUTE_CHAT_XHS    = process.env.ROUTE_CHAT_XHS || '@xhsgallery';
 const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || '@mybigbreastgal';
+
+// ✅ 新增：大文件上传服务（可选，没配置就完全不启用）
+const MTPROTO_UPLOADER = process.env.MTPROTO_UPLOADER || '';   // 例如：https://tg-mtproto-uploader.onrender.com/upload
+const LARGE_FILE_THRESHOLD = Number(process.env.LARGE_FILE_THRESHOLD || 50 * 1024 * 1024); // 默认 50MB
 
 const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
 
@@ -82,13 +88,57 @@ function tgErrInfo(e) {
   return String(e);
 }
 
+// 尝试获取文件大小（字节），失败就返回 null
+async function headContentLength(url) {
+  try {
+    const r = await axios.head(url, { timeout: 15000, maxRedirects: 5 });
+    const cl = r.headers['content-length'] || r.headers['Content-Length'] || null;
+    return cl ? Number(cl) : null;
+  } catch (_) {
+    try {
+      const r2 = await axios.get(url, {
+        headers: { Range: 'bytes=0-0' },
+        timeout: 15000,
+        maxRedirects: 5
+      });
+      const cr = r2.headers['content-range'] || r2.headers['Content-Range'] ||
+                 r2.headers['content-length'] || r2.headers['Content-Length'];
+      if (cr) {
+        const m = (cr + '').match(/\/(\d+)$/);
+        if (m) return Number(m[1]);
+        return Number(cr);
+      }
+    } catch (_) {}
+    return null;
+  }
+}
+
+// 把请求转发给 MTProto 大文件上传服务（可选）
+async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) {
+  if (!MTPROTO_UPLOADER) {
+    throw new Error('MTPROTO_UPLOADER not configured');
+  }
+  console.log(`[MTProto] forward to uploader, reason=${reason}, url=${file.url}`);
+
+  const payload = {
+    chat_id: chatId,
+    url: file.url,
+    type: file.type || (mediaToKind(file) === 'video' ? 'video' : 'photo'),
+    caption: caption || '',
+    parse_mode: useHTML ? 'HTML' : undefined
+  };
+
+  const res = await axios.post(MTPROTO_UPLOADER, payload, { timeout: 0 });
+  return res.data;
+}
+
 // -------- Telegram Senders (支持指定 chat_id) ----------
+// ✅ 这是你原来的 tgSendSingleTo，我们在里面加了「大文件 / 413 → MTProto」分支。
+// 没配置 MTPROTO_UPLOADER 时，逻辑 = 你原来的逻辑。
 async function tgSendSingleTo(chatId, file, caption, useHTML) {
   const kind = mediaToKind(file);
   const endpoint = kind === 'video' ? 'sendVideo' : 'sendPhoto';
-  const payload = {
-    chat_id: chatId
-  };
+  const payload = { chat_id: chatId };
   if (caption) {
     payload.caption = caption;
     if (useHTML) payload.parse_mode = 'HTML';
@@ -100,12 +150,37 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
     payload.photo = file.url;
   }
 
+  const mtEnabled = !!MTPROTO_UPLOADER;
+
+  // 1）如果配置了大文件服务，且文件明显很大，直接走 MTProto
+  if (mtEnabled) {
+    try {
+      const size = await headContentLength(file.url);
+      if (size !== null && size > LARGE_FILE_THRESHOLD) {
+        console.log(`[SMART] large file (${size} bytes) > ${LARGE_FILE_THRESHOLD}, use MTProto uploader first`);
+        return await forwardToMtprotoUploader(chatId, file, caption, useHTML, 'large_by_head');
+      }
+    } catch (_) {
+      // 获取体积失败就当作普通文件继续往下走
+    }
+  }
+
+  // 2）先用 URL 方式走 Bot API（你原来的第一层）
   try {
     const res = await axios.post(`${TG_API}/${endpoint}`, payload, { timeout: 60000 });
     return res.data;
   } catch (e) {
-    // 回退：URL直链不可取时，改为multipart转发
-    console.warn(`[TG] ${endpoint} by URL failed, fallback to multipart...`, tgErrInfo(e));
+    const info = tgErrInfo(e);
+    console.warn(`[TG] ${endpoint} by URL failed`, info);
+
+    // 如果是 413 / 太大，并且配置了 MTProto，则直接丢给 MTProto
+    if (mtEnabled && /413|Request Entity Too Large|too big|file is too big/i.test(info)) {
+      console.log('[SMART] got 413 or too-big, forward to MTProto uploader');
+      return await forwardToMtprotoUploader(chatId, file, caption, useHTML, '413');
+    }
+
+    // 3）否则回退：URL 直链不可取时，改为 multipart 转发（你原来的逻辑）
+    console.warn(`[TG] ${endpoint} by URL failed, fallback to multipart...`);
     try {
       const buf = await axios.get(file.url, { responseType: 'arraybuffer', timeout: 90000 }).then(r=>r.data);
       const fd = new FormData();
@@ -126,7 +201,17 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
       });
       return res2.data;
     } catch (e2) {
-      throw new Error(`sendSingle fallback failed: ${tgErrInfo(e2)}`);
+      const info2 = tgErrInfo(e2);
+      console.warn('[TG] multipart fallback failed:', info2);
+
+      // 4）最后兜底：如果配置了 MTProto，再给一次机会
+      if (mtEnabled) {
+        console.log('[SMART] multipart also failed, final fallback to MTProto uploader');
+        return await forwardToMtprotoUploader(chatId, file, caption, useHTML, 'multipart_fail');
+      }
+
+      // 没配大文件服务，就保持你原来的报错风格
+      throw new Error(`sendSingle fallback failed: ${info2}`);
     }
   }
 }
@@ -219,6 +304,6 @@ app.post('/api/send', async (req, res) => {
 });
 
 // 健康检查
-app.get('/', (_req, res) => res.status(200).send('Media2TG backend is up.'));
+app.get('/', (_req, res) => res.status(200).send('Media2TG backend is up (v2.4).'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Media2TG backend listening on :${PORT}`));
