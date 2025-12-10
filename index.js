@@ -1,5 +1,5 @@
-// --- Media2TG Backend v2.5 (主频道 + 路由频道 + MTProto 超大文件上传) ---
-console.log("Booting Media2TG backend v2.5 ...");
+// --- Media2TG Backend v2.6 (主频道 + 路由频道 + MTProto 超大文件上传 + 通知补发) ---
+console.log("Booting Media2TG backend v2.6 ...");
 
 const express = require("express");
 const cors = require("cors");
@@ -32,7 +32,7 @@ const CHAT_ID_MAIN = process.env.TELEGRAM_CHANNEL_ID;
 const ROUTE_CHAT_XHS = process.env.ROUTE_CHAT_XHS || "@xhsgallery";
 const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || "@mybigbreastgal";
 
-// 新增：MTProto 上传服务地址
+// MTProto 上传服务地址（你已经在 Render 里配好了）
 const MTPROTO_UPLOADER = process.env.MTPROTO_UPLOADER || "";
 
 const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
@@ -89,7 +89,7 @@ function tgErrInfo(e) {
   return String(e);
 }
 
-// -------- 调用 MTProto uploader ----------
+// -------- 调用 MTProto uploader + 额外通知 ----------
 async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) {
   if (!MTPROTO_UPLOADER) {
     throw new Error("MTProto uploader endpoint not configured");
@@ -105,11 +105,39 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) 
   console.log(
     `[MTPROTO] forward to uploader, reason=${reason}, chat=${chatId}, kind=${kind}, url=${file.url}`
   );
+
   try {
     const resp = await axios.post(MTPROTO_UPLOADER, body, {
       timeout: 300000,
     });
-    if (resp.data && resp.data.ok) return resp.data;
+
+    if (resp.data && resp.data.ok) {
+      // ✅ 上传成功后，用 Bot 再发一条“通知文字”，保证有推送
+      if (TG_API) {
+        try {
+          let text = "📥 大文件已通过 MTProto 上传成功";
+          if (caption) {
+            // 简单截断一下，避免太长
+            const shortCap = String(caption).slice(0, 180);
+            text += useHTML ? `\n\n${shortCap}` : `\n\n${shortCap}`;
+          }
+          await axios.post(
+            `${TG_API}/sendMessage`,
+            {
+              chat_id: chatId,
+              text,
+              parse_mode: useHTML ? "HTML" : undefined,
+              disable_web_page_preview: true,
+            },
+            { timeout: 30000 }
+          );
+        } catch (e2) {
+          console.warn("[MTPROTO] notify sendMessage failed", tgErrInfo(e2));
+        }
+      }
+      return resp.data;
+    }
+
     throw new Error(
       `Uploader returned not ok: ${JSON.stringify(resp.data || {})}`
     );
