@@ -1,4 +1,5 @@
 // --- Media2TG Backend v2.5 (主频道 + 路由频道 + MTProto 超大文件上传) ---
+// Modified: add strict URL validation to reject blob/data before attempting Telegram/API calls
 console.log("Booting Media2TG backend v2.5 ...");
 
 const express = require("express");
@@ -32,7 +33,7 @@ const CHAT_ID_MAIN = process.env.TELEGRAM_CHANNEL_ID;
 const ROUTE_CHAT_XHS = process.env.ROUTE_CHAT_XHS || "@xhsgallery";
 const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || "@mybigbreastgal";
 
-// 新增：MTProto 上传服务地址
+// 新增：MTProto 上传服务地址（可选）
 const MTPROTO_UPLOADER = process.env.MTPROTO_UPLOADER || "";
 
 const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
@@ -89,10 +90,21 @@ function tgErrInfo(e) {
   return String(e);
 }
 
+// ---- 校验 URL：只允许 https? 协议，拒绝 blob:/data: 等 ----
+function isHttpUrl(u) {
+  if (!u || typeof u !== "string") return false;
+  const s = u.trim();
+  if (!s) return false;
+  return /^https?:\/\//i.test(s);
+}
+
 // -------- 调用 MTProto uploader ----------
 async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) {
   if (!MTPROTO_UPLOADER) {
     throw new Error("MTProto uploader endpoint not configured");
+  }
+  if (!isHttpUrl(file.url)) {
+    throw new Error(`invalid_file_url: ${file.url}`);
   }
   const kind = mediaToKind(file);
   const body = {
@@ -110,9 +122,7 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) 
       timeout: 300000,
     });
     if (resp.data && resp.data.ok) return resp.data;
-    throw new Error(
-      `Uploader returned not ok: ${JSON.stringify(resp.data || {})}`
-    );
+    throw new Error(`Uploader returned not ok: ${JSON.stringify(resp.data || {})}`);
   } catch (e) {
     console.error("[MTPROTO] uploader error", tgErrInfo(e));
     throw e;
@@ -123,6 +133,11 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) 
 async function tgSendSingleTo(chatId, file, caption, useHTML) {
   const kind = mediaToKind(file);
   const endpoint = kind === "video" ? "sendVideo" : "sendPhoto";
+
+  if (!isHttpUrl(file.url)) {
+    throw new Error(`INVALID_FILE_URL: ${file.url}`);
+  }
+
   const payload = { chat_id: chatId };
 
   if (caption) {
@@ -147,32 +162,18 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
     const code = raw.error_code || e?.response?.status;
     const desc = raw.description || "";
 
-    const isTooLarge =
-      code === 413 || /too (large|big)/i.test(desc || "") || false;
+    const isTooLarge = code === 413 || /too (large|big)/i.test(desc || "") || false;
 
     if (isTooLarge && MTPROTO_UPLOADER) {
-      console.warn(
-        `[TG] ${endpoint} by URL failed with 413, fallback to MTProto uploader...`
-      );
-      return await forwardToMtprotoUploader(
-        chatId,
-        file,
-        caption,
-        useHTML,
-        "413"
-      );
+      console.warn(`[TG] ${endpoint} by URL failed with 413, fallback to MTProto uploader...`);
+      return await forwardToMtprotoUploader(chatId, file, caption, useHTML, "413");
     }
 
-    console.warn(
-      `[TG] ${endpoint} by URL failed, try multipart...`,
-      tgErrInfo(e)
-    );
+    console.warn(`[TG] ${endpoint} by URL failed, try multipart...`, tgErrInfo(e));
 
     // 2) 尝试 multipart 上传（小文件更稳）
     try {
-      const buf = await axios
-        .get(file.url, { responseType: "arraybuffer", timeout: 90000 })
-        .then((r) => r.data);
+      const buf = await axios.get(file.url, { responseType: "arraybuffer", timeout: 90000 }).then((r) => r.data);
 
       const fd = new FormData();
       fd.append("chat_id", chatId);
@@ -195,21 +196,11 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
       const raw2 = e2?.response?.data || {};
       const code2 = raw2.error_code || e2?.response?.status;
       const desc2 = raw2.description || "";
-      const tooLarge2 =
-        code2 === 413 || /too (large|big)/i.test(desc2 || "") || false;
+      const tooLarge2 = code2 === 413 || /too (large|big)/i.test(desc2 || "") || false;
 
       if (tooLarge2 && MTPROTO_UPLOADER) {
-        console.warn(
-          `[TG] multipart fallback failed with 413, fallback to MTProto uploader...`,
-          tgErrInfo(e2)
-        );
-        return await forwardToMtprotoUploader(
-          chatId,
-          file,
-          caption,
-          useHTML,
-          "multipart_fail"
-        );
+        console.warn(`[TG] multipart fallback failed with 413, fallback to MTProto uploader...`, tgErrInfo(e2));
+        return await forwardToMtprotoUploader(chatId, file, caption, useHTML, "multipart_fail");
       }
 
       throw new Error(`sendSingle failed: ${tgErrInfo(e2)}`);
@@ -219,6 +210,7 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
 
 async function tgSendGroupTo(chatId, files, caption, useHTML) {
   // 仅第一项带 caption
+  // 在 media 构造处也保证 media.media 是 http(s)
   const media = files.map((f, idx) => ({
     type: mediaToKind(f) === "video" ? "video" : "photo",
     media: f.url,
@@ -237,10 +229,7 @@ async function tgSendGroupTo(chatId, files, caption, useHTML) {
     );
     return res.data;
   } catch (e) {
-    console.warn(
-      "[TG] sendMediaGroup by URL failed, fallback to per-file...",
-      tgErrInfo(e)
-    );
+    console.warn("[TG] sendMediaGroup by URL failed, fallback to per-file...", tgErrInfo(e));
     const out = [];
     for (let i = 0; i < files.length; i++) {
       const cap = i === 0 ? caption : undefined;
@@ -259,14 +248,24 @@ app.post("/api/send", async (req, res) => {
     if (!BOT_TOKEN || !CHAT_ID_MAIN) {
       return res.status(500).json({
         ok: false,
-        message:
-          "Server env TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID missing.",
+        message: "Server env TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID missing.",
       });
     }
 
     const { noteUrl, pageUrl, title, author, files, source } = req.body || {};
     if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ ok: false, message: "No files to process." });
+    }
+
+    // —— 重要：统一验证 files 内 url，拒绝 blob/data/非 http(s)
+    for (const f of files) {
+      if (!f || !f.url) {
+        return res.status(400).json({ ok: false, code: "INVALID_FILE_ENTRY", message: "file entry missing url", file: f });
+      }
+      if (!isHttpUrl(f.url)) {
+        console.warn(`[VALIDATION] reject non-http file url: ${f.url}`);
+        return res.status(400).json({ ok: false, code: "INVALID_FILE_URL", message: "file.url must be an http(s) URL (not blob:/data:)", url: f.url });
+      }
     }
 
     const captionMain = buildCaptionHTML({
@@ -284,23 +283,9 @@ app.post("/api/send", async (req, res) => {
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
       if (g.length === 1) {
-        mainResults.push(
-          await tgSendSingleTo(
-            CHAT_ID_MAIN,
-            g[0],
-            gi === 0 ? captionMain : undefined,
-            true
-          )
-        );
+        mainResults.push(await tgSendSingleTo(CHAT_ID_MAIN, g[0], gi === 0 ? captionMain : undefined, true));
       } else {
-        mainResults.push(
-          await tgSendGroupTo(
-            CHAT_ID_MAIN,
-            g,
-            gi === 0 ? captionMain : undefined,
-            true
-          )
-        );
+        mainResults.push(await tgSendGroupTo(CHAT_ID_MAIN, g, gi === 0 ? captionMain : undefined, true));
       }
     }
 
@@ -312,51 +297,24 @@ app.post("/api/send", async (req, res) => {
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
       if (g.length === 1) {
-        routedResults.push(
-          await tgSendSingleTo(
-            routedChat,
-            g[0],
-            gi === 0 ? tagCaption : undefined,
-            false
-          )
-        );
+        routedResults.push(await tgSendSingleTo(routedChat, g[0], gi === 0 ? tagCaption : undefined, false));
       } else {
-        routedResults.push(
-          await tgSendGroupTo(
-            routedChat,
-            g,
-            gi === 0 ? tagCaption : undefined,
-            false
-          )
-        );
+        routedResults.push(await tgSendGroupTo(routedChat, g, gi === 0 ? tagCaption : undefined, false));
       }
     }
 
     const ms = Date.now() - t0;
-    console.log(
-      `[OK] forwarded ${files.length} file(s) in ${ms}ms, title="${(title || "").slice(
-        0,
-        40
-      )}"`
-    );
-    return res.status(200).json({
-      ok: true,
-      message: "Successfully forwarded to main & routed channels.",
-      data: { main: mainResults, routed: routedResults },
-    });
+    console.log(`[OK] forwarded ${files.length} file(s) in ${ms}ms, title="${(title || "").slice(0, 40)}"`);
+    return res.status(200).json({ ok: true, message: "Successfully forwarded to main & routed channels.", data: { main: mainResults, routed: routedResults } });
   } catch (e) {
     const ms = Date.now() - t0;
     const info = tgErrInfo(e);
     console.error(`[ERR] /api/send failed in ${ms}ms -> ${info}`);
-    return res
-      .status(500)
-      .json({ ok: false, message: `Failed to send to Telegram: ${info}` });
+    return res.status(500).json({ ok: false, message: `Failed to send to Telegram: ${info}` });
   }
 });
 
 // 健康检查
 app.get("/", (_req, res) => res.status(200).send("Media2TG backend is up."));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`Media2TG backend listening on :${PORT}`)
-);
+app.listen(PORT, () => console.log(`Media2TG backend listening on :${PORT}`));
