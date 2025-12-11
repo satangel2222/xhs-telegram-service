@@ -1,10 +1,13 @@
-// --- Media2TG Backend v2.5 (主频道 + 路由频道 + MTProto 超大文件上传) ---
-console.log("Booting Media2TG backend v2.5 ...");
+// --- Media2TG Backend v2.5 (主频道 + 路由频道 + MTProto 超大文件上传) --- 
+console.log("Booting Media2TG backend v2.5 (hardened) ...");
 
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const FormData = require("form-data");
+const stream = require("stream");
+const util = require("util");
+const pipeline = util.promisify(stream.pipeline);
 
 const app = express();
 
@@ -86,7 +89,65 @@ function mediaToKind(file) {
 function tgErrInfo(e) {
   if (e?.response?.data) return JSON.stringify(e.response.data);
   if (e?.message) return e.message;
+  if (e?.code) return String(e.code);
   return String(e);
+}
+
+// -------- New helpers: URL validation + axios retry ----------
+function isHttpUrl(u) {
+  try {
+    if (!u) return false;
+    const s = String(u).trim();
+    if (!s) return false;
+    if (s.startsWith("blob:") || s.startsWith("data:")) return false;
+    return /^https?:\/\//i.test(s);
+  } catch {
+    return false;
+  }
+}
+
+async function axiosGetWithRetry(url, opts = {}, retries = 2, backoffMs = 800) {
+  const headers = Object.assign(
+    { "User-Agent": "Mozilla/5.0 (compatible; Media2TG/1.0)" },
+    opts.headers || {}
+  );
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await axios.get(url, Object.assign({}, opts, { headers, validateStatus: null }));
+      // treat 2xx as success
+      if (r.status >= 200 && r.status < 300) return r;
+      // for some status codes we may want to retry
+      const retryable = [429, 502, 503, 504].includes(r.status);
+      if (!retryable) {
+        const err = new Error(`HTTP ${r.status}`);
+        err.status = r.status;
+        err.response = r;
+        throw err;
+      }
+      // else fallthrough to retry
+      console.warn(`[HTTP] non-2xx status ${r.status} for ${url} (attempt ${attempt})`);
+      if (attempt === retries) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+      const isLast = attempt === retries;
+      console.warn(`[HTTP] axiosGetWithRetry attempt=${attempt} url=${url} err=${e?.code||e?.message||String(e)}${isLast ? " final" : ""}`);
+      if (isLast) throw e;
+      await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
+    }
+  }
+  throw new Error("axiosGetWithRetry failed");
+}
+
+async function postWithRetry(url, body, tries = 2, axiosOpts = {}) {
+  for (let i = 0; i <= tries; i++) {
+    try {
+      return await axios.post(url, body, axiosOpts);
+    } catch (e) {
+      const isLast = i === tries;
+      console.warn(`[HTTP] postWithRetry attempt=${i} url=${url} err=${e?.code||e?.message||String(e)}${isLast ? " final" : ""}`);
+      if (isLast) throw e;
+      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    }
+  }
 }
 
 // -------- 调用 MTProto uploader ----------
@@ -95,6 +156,12 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) 
     throw new Error("MTProto uploader endpoint not configured");
   }
   const kind = mediaToKind(file);
+
+  // validate url early
+  if (!isHttpUrl(file.url)) {
+    throw new Error(`Invalid file URL protocol: ${file.url}`);
+  }
+
   const body = {
     chat_id: chatId,
     file_url: file.url,
@@ -106,13 +173,13 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) 
     `[MTPROTO] forward to uploader, reason=${reason}, chat=${chatId}, kind=${kind}, url=${file.url}`
   );
   try {
-    const resp = await axios.post(MTPROTO_UPLOADER, body, {
+    // use retry wrapper
+    const resp = await postWithRetry(MTPROTO_UPLOADER, body, 2, {
       timeout: 300000,
+      headers: { "Content-Type": "application/json" },
     });
     if (resp.data && resp.data.ok) return resp.data;
-    throw new Error(
-      `Uploader returned not ok: ${JSON.stringify(resp.data || {})}`
-    );
+    throw new Error(`Uploader returned not ok: ${JSON.stringify(resp.data || {})}`);
   } catch (e) {
     console.error("[MTPROTO] uploader error", tgErrInfo(e));
     throw e;
@@ -140,13 +207,25 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
   try {
     const res = await axios.post(`${TG_API}/${endpoint}`, payload, {
       timeout: 60000,
+      validateStatus: null,
     });
-    return res.data;
-  } catch (e) {
-    const raw = e?.response?.data || {};
-    const code = raw.error_code || e?.response?.status;
+    if (res.status >= 200 && res.status < 300) return res.data;
+    // treat certain codes as errors to fallback
+    const raw = res.data || {};
+    const code = raw.error_code || res.status;
     const desc = raw.description || "";
-
+    // If 413 or "too large" from telegram, we'll fallback
+    const isTooLarge =
+      code === 413 || /too (large|big)/i.test(desc || "") || false;
+    if (!isTooLarge) {
+      // Non-retryable (like 400/401/403) -> throw with reason
+      throw { response: { status: res.status, data: res.data }, message: `TG API returned ${res.status}` };
+    }
+  } catch (e) {
+    // If axios threw because of network or invalid protocol, handle below
+    const raw = e?.response?.data || {};
+    const code = raw?.error_code || e?.response?.status;
+    const desc = raw?.description || e?.message || "";
     const isTooLarge =
       code === 413 || /too (large|big)/i.test(desc || "") || false;
 
@@ -168,11 +247,16 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
       tgErrInfo(e)
     );
 
-    // 2) 尝试 multipart 上传（小文件更稳）
+    // 2) 尝试 multipart 上传（小文件更稳） —— 这里做严格 url 校验与重试下载
     try {
-      const buf = await axios
-        .get(file.url, { responseType: "arraybuffer", timeout: 90000 })
-        .then((r) => r.data);
+      if (!isHttpUrl(file.url)) {
+        // 如果不是 http(s) 直接拒绝，避免传入 blob:
+        throw new Error(`Unsupported protocol or invalid url: ${file.url}`);
+      }
+
+      // 下载二进制数据，带重试
+      const resp = await axiosGetWithRetry(file.url, { responseType: "arraybuffer", timeout: 180000 }, 3, 800);
+      const buf = resp.data;
 
       const fd = new FormData();
       fd.append("chat_id", chatId);
@@ -182,19 +266,45 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
       }
       const field = kind === "video" ? "video" : "photo";
       const filename = kind === "video" ? "video.mp4" : "image.jpg";
-      fd.append(field, buf, { filename });
+      // Buffer is acceptable to form-data in Node
+      fd.append(field, Buffer.from(buf), { filename });
 
+      const headers = fd.getHeaders();
       const res2 = await axios.post(`${TG_API}/${endpoint}`, fd, {
-        headers: fd.getHeaders(),
+        headers,
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
-        timeout: 120000,
+        timeout: 180000,
+        validateStatus: null,
       });
-      return res2.data;
+
+      if (res2.status >= 200 && res2.status < 300) return res2.data;
+
+      // If multipart also returns 413 and mtproto exists -> forward
+      const raw2 = res2.data || {};
+      const code2 = raw2.error_code || res2.status;
+      const desc2 = raw2.description || "";
+      const tooLarge2 = code2 === 413 || /too (large|big)/i.test(desc2 || "") || false;
+
+      if (tooLarge2 && MTPROTO_UPLOADER) {
+        console.warn(
+          `[TG] multipart fallback failed with 413, fallback to MTProto uploader...`,
+          tgErrInfo(res2)
+        );
+        return await forwardToMtprotoUploader(
+          chatId,
+          file,
+          caption,
+          useHTML,
+          "multipart_fail"
+        );
+      }
+
+      throw new Error(`sendSingle multipart failed: ${JSON.stringify(res2.data||res2.status)}`);
     } catch (e2) {
       const raw2 = e2?.response?.data || {};
-      const code2 = raw2.error_code || e2?.response?.status;
-      const desc2 = raw2.description || "";
+      const code2 = raw2?.error_code || e2?.response?.status;
+      const desc2 = raw2?.description || e2?.message || "";
       const tooLarge2 =
         code2 === 413 || /too (large|big)/i.test(desc2 || "") || false;
 
@@ -208,13 +318,17 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
           file,
           caption,
           useHTML,
-          "multipart_fail"
+          "multipart_fail2"
         );
       }
 
       throw new Error(`sendSingle failed: ${tgErrInfo(e2)}`);
     }
   }
+
+  // if initial try succeeded we already returned earlier
+  // but to satisfy control flow, return a generic error
+  throw new Error("tgSendSingleTo unexpected end");
 }
 
 async function tgSendGroupTo(chatId, files, caption, useHTML) {
@@ -233,14 +347,19 @@ async function tgSendGroupTo(chatId, files, caption, useHTML) {
         chat_id: chatId,
         media,
       },
-      { timeout: 90000 }
+      { timeout: 90000, validateStatus: null }
     );
-    return res.data;
+    if (res.status >= 200 && res.status < 300) return res.data;
+    console.warn("[TG] sendMediaGroup by URL failed, fallback to per-file...", res.status);
+    // fallback: per-file
+    const out = [];
+    for (let i = 0; i < files.length; i++) {
+      const cap = i === 0 ? caption : undefined;
+      out.push(await tgSendSingleTo(chatId, files[i], cap, useHTML));
+    }
+    return { ok: true, results: out };
   } catch (e) {
-    console.warn(
-      "[TG] sendMediaGroup by URL failed, fallback to per-file...",
-      tgErrInfo(e)
-    );
+    console.warn("[TG] sendMediaGroup failed, fallback to per-file...", tgErrInfo(e));
     const out = [];
     for (let i = 0; i < files.length; i++) {
       const cap = i === 0 ? caption : undefined;
@@ -267,6 +386,16 @@ app.post("/api/send", async (req, res) => {
     const { noteUrl, pageUrl, title, author, files, source } = req.body || {};
     if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ ok: false, message: "No files to process." });
+    }
+
+    // defensive: filter out invalid URLs early and mark which ones invalid
+    const invalid = files.filter(f => !isHttpUrl(f.url));
+    if (invalid.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        message: "Some file URLs are invalid or unsupported protocol (blob/data).",
+        invalid: invalid.map(f => f.url),
+      });
     }
 
     const captionMain = buildCaptionHTML({
@@ -348,9 +477,12 @@ app.post("/api/send", async (req, res) => {
     const ms = Date.now() - t0;
     const info = tgErrInfo(e);
     console.error(`[ERR] /api/send failed in ${ms}ms -> ${info}`);
+    // make error messages clearer for client debugging
+    const status = e?.response?.status || 500;
+    const detail = e?.response?.data || e?.message || String(e);
     return res
       .status(500)
-      .json({ ok: false, message: `Failed to send to Telegram: ${info}` });
+      .json({ ok: false, message: `Failed to send to Telegram: ${detail}` });
   }
 });
 
