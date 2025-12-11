@@ -1,11 +1,15 @@
-// --- Media2TG Backend v2.5 (主频道 + 路由频道 + MTProto 超大文件上传) ---
-// 改进：增加下载/上传重试、User-Agent/Referer、延长超时与更详细日志
-console.log("Booting Media2TG backend v2.5 (hardened) ...");
+// index.js
+// --- Media2TG Backend v2.6 (robust streaming + retries) ---
+console.log("Booting Media2TG backend v2.6 ...");
 
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const FormData = require("form-data");
+const stream = require("stream");
+const util = require("util");
+const pipeline = util.promisify(stream.pipeline);
+const URL = require("url").URL;
 
 const app = express();
 
@@ -33,8 +37,7 @@ const CHAT_ID_MAIN = process.env.TELEGRAM_CHANNEL_ID;
 const ROUTE_CHAT_XHS = process.env.ROUTE_CHAT_XHS || "@xhsgallery";
 const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || "@mybigbreastgal";
 
-// 新增：MTProto 上传服务地址（形如 https://tg-mtproto-uploader.onrender.com/upload 或 根URL）
-// 请确保环境变量正确指向可达的 uploader POST /upload 路径
+// MTProto 上传服务地址：必须以 https:// 开头并指向你的 uploader 的 /upload 接口
 const MTPROTO_UPLOADER = process.env.MTPROTO_UPLOADER || "";
 
 const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
@@ -91,80 +94,40 @@ function tgErrInfo(e) {
   return String(e);
 }
 
-// -------- Network helpers: retries, headers --------
-// 默认重试次数
-const DEFAULT_RETRIES = 3;
-
-function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
-
-// 构建通用 headers（部分 CDN 需要 UA / Referer）
-function defaultDownloadHeaders(pageUrl) {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    Referer: pageUrl || "",
-  };
-}
-
-// 带重试的 axios.get（用于 multipart 下载）
-// options: { responseType, timeout, headers }
-async function axiosGetWithRetry(url, options = {}, retries = DEFAULT_RETRIES) {
-  let attempt = 0;
-  let lastErr = null;
-  for (; attempt < retries; attempt++) {
-    try {
-      const resp = await axios.get(url, {
-        method: "GET",
-        responseType: options.responseType || "arraybuffer",
-        timeout: options.timeout || 120000,
-        headers: options.headers || {},
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity,
-        validateStatus: (s) => s >= 200 && s < 400, // accept 2xx and 3xx
-      });
-      return resp;
-    } catch (e) {
-      lastErr = e;
-      const code = e?.code || e?.response?.status || "";
-      console.warn(`[NET] axios.get attempt=${attempt + 1} failed for ${url} -> ${code} ${e?.message || ""}`);
-      // 对一些瞬时错误做退避重试
-      const backoff = 500 * Math.pow(2, attempt);
-      await sleep(backoff);
-    }
+function isHttpUrl(u) {
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (e) {
+    return false;
   }
-  throw lastErr;
 }
 
-// 带重试的 axios.post（用于 MTProto Uploader / 远端 API）
-// options: { timeout, headers }
-async function axiosPostWithRetry(url, body, options = {}, retries = DEFAULT_RETRIES) {
-  let attempt = 0;
-  let lastErr = null;
-  for (; attempt < retries; attempt++) {
+// -------- Retry helper ----------
+async function retry(fn, attempts = 3, baseDelay = 500) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
     try {
-      const resp = await axios.post(url, body, {
-        timeout: options.timeout || 180000,
-        headers: options.headers || {},
-      });
-      return resp;
+      return await fn();
     } catch (e) {
       lastErr = e;
-      console.warn(`[NET] axios.post attempt=${attempt + 1} failed for ${url} -> ${e?.code || e?.response?.status || ""} ${e?.message || ""}`);
-      const backoff = 700 * Math.pow(2, attempt);
-      await sleep(backoff);
+      const wait = baseDelay * Math.pow(2, i);
+      console.warn(`[RETRY] attempt=${i + 1} failed, will wait ${wait}ms -> ${tgErrInfo(e)}`);
+      await new Promise((r) => setTimeout(r, wait));
     }
   }
   throw lastErr;
 }
 
 // -------- 调用 MTProto uploader ----------
-async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason, pageUrl) {
+async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason) {
   if (!MTPROTO_UPLOADER) {
     throw new Error("MTProto uploader endpoint not configured");
   }
+  if (!isHttpUrl(file.url)) {
+    throw new Error("Invalid file.url for mtproto uploader");
+  }
+
   const kind = mediaToKind(file);
   const body = {
     chat_id: chatId,
@@ -176,22 +139,46 @@ async function forwardToMtprotoUploader(chatId, file, caption, useHTML, reason, 
   console.log(
     `[MTPROTO] forward to uploader, reason=${reason}, chat=${chatId}, kind=${kind}, url=${file.url}`
   );
-  try {
-    // 使用带重试的 post
-    const resp = await axiosPostWithRetry(MTPROTO_UPLOADER, body, {
+
+  return await retry(async () => {
+    const resp = await axios.post(MTPROTO_UPLOADER, body, {
       timeout: 300000,
-      headers: { "Content-Type": "application/json", "User-Agent": defaultDownloadHeaders(pageUrl)["User-Agent"] },
-    }, 3);
+    });
     if (resp.data && resp.data.ok) return resp.data;
     throw new Error(`Uploader returned not ok: ${JSON.stringify(resp.data || {})}`);
-  } catch (e) {
-    console.error("[MTPROTO] uploader error", tgErrInfo(e));
+  }, 3, 1000).catch((e) => {
+    console.error("[MTPROTO] uploader error after retries", tgErrInfo(e));
     throw e;
-  }
+  });
+}
+
+// -------- Streaming download helper (used for multipart fallback) ----------
+async function downloadStreamForMultipart(url, timeout = 180000) {
+  if (!isHttpUrl(url)) throw new Error("Invalid URL");
+  return await retry(async () => {
+    // axios with stream
+    const resp = await axios.get(url, {
+      responseType: "stream",
+      timeout,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      headers: {
+        // optional - some hosts require user-agent
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+      },
+    });
+    if (resp.status < 200 || resp.status >= 300) {
+      const err = new Error("Bad status " + resp.status);
+      err.response = resp;
+      throw err;
+    }
+    return { stream: resp.data, headers: resp.headers };
+  }, 3, 1000);
 }
 
 // -------- Telegram Senders (支持指定 chat_id) ----------
-async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
+async function tgSendSingleTo(chatId, file, caption, useHTML) {
   const kind = mediaToKind(file);
   const endpoint = kind === "video" ? "sendVideo" : "sendPhoto";
   const payload = { chat_id: chatId };
@@ -207,16 +194,19 @@ async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
     payload.photo = file.url;
   }
 
+  if (!isHttpUrl(file.url)) {
+    throw new Error("Invalid file URL");
+  }
+
   // 1) 先尝试走 Bot（URL），失败再看要不要走 MTProto
   try {
     const res = await axios.post(`${TG_API}/${endpoint}`, payload, {
       timeout: 60000,
-      headers: { "User-Agent": defaultDownloadHeaders(pageUrl)["User-Agent"] },
     });
     return res.data;
   } catch (e) {
     const raw = e?.response?.data || {};
-    const code = raw.error_code || e?.response?.status;
+    const code = raw.error_code || (e?.response && e.response.status) || null;
     const desc = raw.description || "";
 
     const isTooLarge =
@@ -226,14 +216,7 @@ async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
       console.warn(
         `[TG] ${endpoint} by URL failed with 413, fallback to MTProto uploader...`
       );
-      return await forwardToMtprotoUploader(
-        chatId,
-        file,
-        caption,
-        useHTML,
-        "413",
-        pageUrl
-      );
+      return await forwardToMtprotoUploader(chatId, file, caption, useHTML, "413");
     }
 
     console.warn(
@@ -241,16 +224,9 @@ async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
       tgErrInfo(e)
     );
 
-    // 2) 尝试 multipart 上传（小文件更稳） —— 下载时也做重试并加头
+    // 2) 尝试 multipart 上传（stream 下载并直接 pipe 到 form-data）
     try {
-      // 建议先用带重试的 get，增加 Referer/UA 防护
-      const dlResp = await axiosGetWithRetry(file.url, {
-        responseType: "arraybuffer",
-        timeout: 180000,
-        headers: defaultDownloadHeaders(pageUrl),
-      }, 3);
-
-      const buf = dlResp.data;
+      const { stream: videoStream, headers } = await downloadStreamForMultipart(file.url, 180000);
 
       const fd = new FormData();
       fd.append("chat_id", chatId);
@@ -260,19 +236,27 @@ async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
       }
       const field = kind === "video" ? "video" : "photo";
       const filename = kind === "video" ? "video.mp4" : "image.jpg";
-      // axios with form-data: pass buffer + headers
-      fd.append(field, buf, { filename });
+
+      // 如果远端返回 content-length，可以传 knownLength，FormData getLengthSync 有时失败，包里会自动处理
+      const contentLength = headers && (headers["content-length"] || headers["Content-Length"]);
+      if (contentLength) {
+        fd.append(field, videoStream, { filename, knownLength: Number(contentLength) });
+      } else {
+        fd.append(field, videoStream, { filename });
+      }
 
       const res2 = await axios.post(`${TG_API}/${endpoint}`, fd, {
-        headers: Object.assign(fd.getHeaders(), { "User-Agent": defaultDownloadHeaders(pageUrl)["User-Agent"] }),
+        headers: {
+          ...fd.getHeaders(),
+        },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
-        timeout: 240000,
+        timeout: 180000,
       });
       return res2.data;
     } catch (e2) {
       const raw2 = e2?.response?.data || {};
-      const code2 = raw2.error_code || e2?.response?.status;
+      const code2 = raw2.error_code || (e2?.response && e2.response.status) || null;
       const desc2 = raw2.description || "";
       const tooLarge2 =
         code2 === 413 || /too (large|big)/i.test(desc2 || "") || false;
@@ -282,23 +266,15 @@ async function tgSendSingleTo(chatId, file, caption, useHTML, pageUrl) {
           `[TG] multipart fallback failed with 413, fallback to MTProto uploader...`,
           tgErrInfo(e2)
         );
-        return await forwardToMtprotoUploader(
-          chatId,
-          file,
-          caption,
-          useHTML,
-          "multipart_fail",
-          pageUrl
-        );
+        return await forwardToMtprotoUploader(chatId, file, caption, useHTML, "multipart_fail");
       }
 
-      // 如果是连接被重置（ECONNRESET/ETIMEDOUT），把错误抛出上层并记录
       throw new Error(`sendSingle failed: ${tgErrInfo(e2)}`);
     }
   }
 }
 
-async function tgSendGroupTo(chatId, files, caption, useHTML, pageUrl) {
+async function tgSendGroupTo(chatId, files, caption, useHTML) {
   // 仅第一项带 caption
   const media = files.map((f, idx) => ({
     type: mediaToKind(f) === "video" ? "video" : "photo",
@@ -314,7 +290,7 @@ async function tgSendGroupTo(chatId, files, caption, useHTML, pageUrl) {
         chat_id: chatId,
         media,
       },
-      { timeout: 90000, headers: { "User-Agent": defaultDownloadHeaders().UserAgent } }
+      { timeout: 90000 }
     );
     return res.data;
   } catch (e) {
@@ -350,6 +326,13 @@ app.post("/api/send", async (req, res) => {
       return res.status(400).json({ ok: false, message: "No files to process." });
     }
 
+    // 基本验证每个 file.url 是 http(s)
+    for (const f of files) {
+      if (!f || typeof f.url !== "string" || !isHttpUrl(f.url)) {
+        return res.status(400).json({ ok: false, message: "Invalid file.url in request." });
+      }
+    }
+
     const captionMain = buildCaptionHTML({
       title,
       author,
@@ -370,8 +353,7 @@ app.post("/api/send", async (req, res) => {
             CHAT_ID_MAIN,
             g[0],
             gi === 0 ? captionMain : undefined,
-            true,
-            pageUrl
+            true
           )
         );
       } else {
@@ -380,8 +362,7 @@ app.post("/api/send", async (req, res) => {
             CHAT_ID_MAIN,
             g,
             gi === 0 ? captionMain : undefined,
-            true,
-            pageUrl
+            true
           )
         );
       }
@@ -400,8 +381,7 @@ app.post("/api/send", async (req, res) => {
             routedChat,
             g[0],
             gi === 0 ? tagCaption : undefined,
-            false,
-            pageUrl
+            false
           )
         );
       } else {
@@ -410,8 +390,7 @@ app.post("/api/send", async (req, res) => {
             routedChat,
             g,
             gi === 0 ? tagCaption : undefined,
-            false,
-            pageUrl
+            false
           )
         );
       }
