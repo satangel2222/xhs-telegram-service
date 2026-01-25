@@ -73,6 +73,7 @@ function tagBySource(source = "") {
   if (s === "redgifs") return "#Redgifs";
   if (s === "tiktok") return "#TikTok";
   if (s === "douyin") return "#抖音";
+  if (s === "reddit") return "#Reddit";
   return "#Unknown";
 }
 
