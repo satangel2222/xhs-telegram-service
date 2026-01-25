@@ -433,13 +433,19 @@ app.post("/api/send", async (req, res) => {
       return results;
     }
 
-    // 1) 主频道
+    // 1) 主频道：发送完整内容
     const mainResults = await sendMediaWithLongCaption(CHAT_ID_MAIN, groups, captionMain);
 
-    // 2) 路由频道（完整内容 + 平台 tag）
+    // 2) 路由频道：根据来源决定内容
     const routedChat = routeChatBySource(source);
     const tagCaption = tagBySource(source);
-    const captionRouted = captionMain + `\n\n${tagCaption}`;
+    const srcLower = (source || "").toLowerCase();
+
+    // XHS 路由频道 (@xhsgallery)：发送完整内容 + tag
+    // 其他平台路由频道 (@mybigbreastgal)：只发送 tag，不公开其他内容
+    const captionRouted = srcLower === "xhs"
+      ? captionMain + `\n\n${tagCaption}`  // XHS: 完整内容 + tag
+      : tagCaption;                         // 其他: 仅 tag
 
     const routedResults = await sendMediaWithLongCaption(routedChat, groups, captionRouted);
 
