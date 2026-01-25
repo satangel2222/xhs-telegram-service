@@ -1,6 +1,6 @@
 // index.js
-// --- Media2TG Backend v2.8 (支持超长内容) ---
-console.log("Booting Media2TG backend v2.8 ...");
+// --- Media2TG Backend v2.9 (修复循环引用错误) ---
+console.log("Booting Media2TG backend v2.9 ...");
 
 // Telegram 限制：媒体 caption 最多 1024 字符，文本消息最多 4096 字符
 const TG_CAPTION_LIMIT = 1024;
@@ -151,9 +151,32 @@ function mediaToKind(file) {
 }
 
 function tgErrInfo(e) {
-  if (e?.response?.data) return JSON.stringify(e.response.data);
+  // 安全提取错误信息，避免循环引用问题
+  try {
+    if (e?.response?.data) {
+      // 只提取需要的字段，避免序列化整个对象
+      const data = e.response.data;
+      if (typeof data === 'string') return data;
+      if (typeof data === 'object') {
+        const safe = {
+          ok: data.ok,
+          error_code: data.error_code,
+          description: data.description,
+        };
+        return JSON.stringify(safe);
+      }
+    }
+  } catch (jsonErr) {
+    // JSON.stringify 失败，继续尝试其他方式
+  }
+
   if (e?.message) return e.message;
-  return String(e);
+
+  try {
+    return String(e);
+  } catch {
+    return "Unknown error";
+  }
 }
 
 function isHttpUrl(u) {
