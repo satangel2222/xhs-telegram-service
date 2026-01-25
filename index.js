@@ -1,6 +1,6 @@
 // index.js
-// --- Media2TG Backend v2.6 (robust streaming + retries) ---
-console.log("Booting Media2TG backend v2.6 ...");
+// --- Media2TG Backend v2.7 (路由频道完整内容) ---
+console.log("Booting Media2TG backend v2.7 ...");
 
 const express = require("express");
 const cors = require("cors");
@@ -368,9 +368,12 @@ app.post("/api/send", async (req, res) => {
       }
     }
 
-    // 2) 路由频道（只带平台 tag）
+    // 2) 路由频道（完整内容 + 平台 tag）
     const routedChat = routeChatBySource(source);
     const tagCaption = tagBySource(source);
+
+    // 修复：路由频道也发送完整内容，在末尾加上平台 tag
+    const captionRouted = captionMain + `\n\n${tagCaption}`;
 
     const routedResults = [];
     for (let gi = 0; gi < groups.length; gi++) {
@@ -380,8 +383,8 @@ app.post("/api/send", async (req, res) => {
           await tgSendSingleTo(
             routedChat,
             g[0],
-            gi === 0 ? tagCaption : undefined,
-            false
+            gi === 0 ? captionRouted : undefined,
+            true  // 改为 true 以支持 HTML 格式
           )
         );
       } else {
@@ -389,8 +392,8 @@ app.post("/api/send", async (req, res) => {
           await tgSendGroupTo(
             routedChat,
             g,
-            gi === 0 ? tagCaption : undefined,
-            false
+            gi === 0 ? captionRouted : undefined,
+            true  // 改为 true 以支持 HTML 格式
           )
         );
       }
