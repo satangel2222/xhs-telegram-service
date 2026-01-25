@@ -1,6 +1,10 @@
 // index.js
-// --- Media2TG Backend v2.7 (路由频道完整内容) ---
-console.log("Booting Media2TG backend v2.7 ...");
+// --- Media2TG Backend v2.8 (支持超长内容) ---
+console.log("Booting Media2TG backend v2.8 ...");
+
+// Telegram 限制：媒体 caption 最多 1024 字符，文本消息最多 4096 字符
+const TG_CAPTION_LIMIT = 1024;
+const TG_TEXT_LIMIT = 4096;
 
 const express = require("express");
 const cors = require("cors");
@@ -70,6 +74,63 @@ function tagBySource(source = "") {
   if (s === "tiktok") return "#TikTok";
   if (s === "douyin") return "#抖音";
   return "#Unknown";
+}
+
+// 分割长文本为多个消息（每个最多 4096 字符，在换行处分割）
+function splitLongText(text, maxLen = TG_TEXT_LIMIT) {
+  if (!text || text.length <= maxLen) return [text];
+
+  const parts = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      parts.push(remaining);
+      break;
+    }
+
+    // 在 maxLen 范围内找最后一个换行符
+    let splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt <= 0 || splitAt < maxLen * 0.5) {
+      // 没有合适的换行符，在空格处分割
+      splitAt = remaining.lastIndexOf(' ', maxLen);
+    }
+    if (splitAt <= 0 || splitAt < maxLen * 0.5) {
+      // 还是没有，强制在 maxLen 处分割
+      splitAt = maxLen;
+    }
+
+    parts.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  return parts;
+}
+
+// 发送纯文本消息（支持 HTML）
+async function tgSendTextTo(chatId, text, useHTML = true) {
+  const payload = {
+    chat_id: chatId,
+    text: text,
+  };
+  if (useHTML) payload.parse_mode = "HTML";
+
+  const res = await axios.post(`${TG_API}/sendMessage`, payload, {
+    timeout: 30000,
+  });
+  return res.data;
+}
+
+// 发送完整内容（自动分段，支持任意长度）
+async function tgSendFullContent(chatId, fullCaption, useHTML = true) {
+  const parts = splitLongText(fullCaption, TG_TEXT_LIMIT);
+  const results = [];
+
+  for (const part of parts) {
+    results.push(await tgSendTextTo(chatId, part, useHTML));
+  }
+
+  return results;
 }
 
 function routeChatBySource(source = "") {
@@ -343,61 +404,44 @@ app.post("/api/send", async (req, res) => {
 
     const groups = chunk(files, 10);
 
-    // 1) 主频道
-    const mainResults = [];
-    for (let gi = 0; gi < groups.length; gi++) {
-      const g = groups[gi];
-      if (g.length === 1) {
-        mainResults.push(
-          await tgSendSingleTo(
-            CHAT_ID_MAIN,
-            g[0],
-            gi === 0 ? captionMain : undefined,
-            true
-          )
-        );
-      } else {
-        mainResults.push(
-          await tgSendGroupTo(
-            CHAT_ID_MAIN,
-            g,
-            gi === 0 ? captionMain : undefined,
-            true
-          )
-        );
+    // 辅助函数：发送媒体到指定频道，支持超长内容
+    async function sendMediaWithLongCaption(chatId, mediaGroups, fullCaption) {
+      const results = [];
+      const isLongCaption = fullCaption && fullCaption.length > TG_CAPTION_LIMIT;
+
+      // 如果内容超长，媒体不带caption，稍后单独发送文本
+      const mediaCaption = isLongCaption ? null : fullCaption;
+
+      for (let gi = 0; gi < mediaGroups.length; gi++) {
+        const g = mediaGroups[gi];
+        const cap = gi === 0 ? mediaCaption : undefined;
+
+        if (g.length === 1) {
+          results.push(await tgSendSingleTo(chatId, g[0], cap, true));
+        } else {
+          results.push(await tgSendGroupTo(chatId, g, cap, true));
+        }
       }
+
+      // 如果内容超长，单独发送完整文本消息（自动分段）
+      if (isLongCaption) {
+        console.log(`[LONG] caption ${fullCaption.length} chars > ${TG_CAPTION_LIMIT}, sending as separate text`);
+        const textResults = await tgSendFullContent(chatId, fullCaption, true);
+        results.push({ type: 'text_messages', count: textResults.length, results: textResults });
+      }
+
+      return results;
     }
+
+    // 1) 主频道
+    const mainResults = await sendMediaWithLongCaption(CHAT_ID_MAIN, groups, captionMain);
 
     // 2) 路由频道（完整内容 + 平台 tag）
     const routedChat = routeChatBySource(source);
     const tagCaption = tagBySource(source);
-
-    // 修复：路由频道也发送完整内容，在末尾加上平台 tag
     const captionRouted = captionMain + `\n\n${tagCaption}`;
 
-    const routedResults = [];
-    for (let gi = 0; gi < groups.length; gi++) {
-      const g = groups[gi];
-      if (g.length === 1) {
-        routedResults.push(
-          await tgSendSingleTo(
-            routedChat,
-            g[0],
-            gi === 0 ? captionRouted : undefined,
-            true  // 改为 true 以支持 HTML 格式
-          )
-        );
-      } else {
-        routedResults.push(
-          await tgSendGroupTo(
-            routedChat,
-            g,
-            gi === 0 ? captionRouted : undefined,
-            true  // 改为 true 以支持 HTML 格式
-          )
-        );
-      }
-    }
+    const routedResults = await sendMediaWithLongCaption(routedChat, groups, captionRouted);
 
     const ms = Date.now() - t0;
     console.log(
