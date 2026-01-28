@@ -211,6 +211,16 @@ function isHttpUrl(u) {
 }
 
 // -------- Retry helper ----------
+function getRetryAfterMs(e) {
+  // 从 Telegram 429 响应中提取 retry_after 秒数
+  const data = e?.response?.data;
+  const status = e?.response?.status;
+  if (status !== 429 && data?.error_code !== 429) return null;
+  const secs = data?.parameters?.retry_after || data?.retry_after;
+  if (secs && typeof secs === "number") return secs * 1000 + 1000; // 多等 1s 余量
+  return 35000; // 默认 35s（Telegram 常见限制 30s + 余量）
+}
+
 async function retry(fn, attempts = 3, baseDelay = 500) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -218,8 +228,9 @@ async function retry(fn, attempts = 3, baseDelay = 500) {
       return await fn();
     } catch (e) {
       lastErr = e;
-      const wait = baseDelay * Math.pow(2, i);
-      console.warn(`[RETRY] attempt=${i + 1} failed, will wait ${wait}ms -> ${tgErrInfo(e)}`);
+      const retryAfter = getRetryAfterMs(e);
+      const wait = retryAfter || baseDelay * Math.pow(2, i);
+      console.warn(`[RETRY] attempt=${i + 1} failed, will wait ${wait}ms${retryAfter ? " (429 retry_after)" : ""} -> ${tgErrInfo(e)}`);
       await new Promise((r) => setTimeout(r, wait));
     }
   }
@@ -319,11 +330,13 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
     throw new Error("Invalid file URL");
   }
 
-  // 1) 先尝试走 Bot（URL），失败再看要不要走 MTProto
+  // 1) 先尝试走 Bot（URL），带 429 重试
   try {
-    const res = await axios.post(`${TG_API}/${endpoint}`, payload, {
-      timeout: 60000,
-    });
+    const res = await retry(async () => {
+      return await axios.post(`${TG_API}/${endpoint}`, payload, {
+        timeout: 60000,
+      });
+    }, 4, 1000);
     return res.data;
   } catch (e) {
     const raw = e?.response?.data || {};
@@ -340,12 +353,17 @@ async function tgSendSingleTo(chatId, file, caption, useHTML) {
       return await forwardToMtprotoUploader(chatId, file, caption, useHTML, "413");
     }
 
+    // 如果 429 重试全部用尽，不再降级到 multipart（multipart 一样会 429）
+    if (code === 429 || raw.error_code === 429) {
+      throw new Error(`sendSingle failed: rate limited after retries (URL: ${file.url.slice(0, 80)}...)`);
+    }
+
     const urlErr = tgErrInfo(e);
     console.warn(`[TG] ${endpoint} by URL failed: ${urlErr}`);
     console.log(`[TG] URL was: ${file.url}`);
     console.log(`[TG] Trying multipart upload fallback...`);
 
-    // 2) 尝试 multipart 上传（stream 下载并直接 pipe 到 form-data）
+    // 2) 尝试 multipart 上传（stream 下载并直接 pipe 到 form-data），带 429 重试
     try {
       const { stream: videoStream, headers } = await downloadStreamForMultipart(file.url, 180000);
 
@@ -408,16 +426,26 @@ async function tgSendGroupTo(chatId, files, caption, useHTML) {
   }));
 
   try {
-    const res = await axios.post(
-      `${TG_API}/sendMediaGroup`,
-      {
-        chat_id: chatId,
-        media,
-      },
-      { timeout: 90000 }
-    );
+    const res = await retry(async () => {
+      return await axios.post(
+        `${TG_API}/sendMediaGroup`,
+        {
+          chat_id: chatId,
+          media,
+        },
+        { timeout: 90000 }
+      );
+    }, 4, 1000);
     return res.data;
   } catch (e) {
+    // 如果是 429 重试全部用尽，不再降级为逐个发送（会加剧速率限制）
+    const raw = e?.response?.data || {};
+    const code = raw.error_code || (e?.response && e.response.status) || null;
+    if (code === 429 || raw.error_code === 429) {
+      console.error("[TG] sendMediaGroup rate limited after retries, not falling back to per-file");
+      throw e;
+    }
+
     console.warn(
       "[TG] sendMediaGroup by URL failed, fallback to per-file...",
       tgErrInfo(e)
@@ -476,6 +504,10 @@ app.post("/api/send", async (req, res) => {
       const mediaCaption = isLongCaption ? null : fullCaption;
 
       for (let gi = 0; gi < mediaGroups.length; gi++) {
+        // 多组之间间隔 2s，主动避免触发 Telegram 速率限制
+        if (gi > 0) {
+          await new Promise((r) => setTimeout(r, 2000));
+        }
         const g = mediaGroups[gi];
         const cap = gi === 0 ? mediaCaption : undefined;
 
@@ -498,6 +530,9 @@ app.post("/api/send", async (req, res) => {
 
     // 1) 主频道：发送完整内容
     const mainResults = await sendMediaWithLongCaption(CHAT_ID_MAIN, groups, captionMain);
+
+    // 频道间间隔 3s，避免 Telegram 速率限制
+    await new Promise((r) => setTimeout(r, 3000));
 
     // 2) 路由频道：根据来源决定内容
     const routedChat = routeChatBySource(source);
