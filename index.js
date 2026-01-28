@@ -44,6 +44,12 @@ const ROUTE_CHAT_OTHERS = process.env.ROUTE_CHAT_OTHERS || "@mybigbreastgal";
 // MTProto 上传服务地址：必须以 https:// 开头并指向你的 uploader 的 /upload 接口
 const MTPROTO_UPLOADER = process.env.MTPROTO_UPLOADER || "";
 
+// AI 图像分析配置
+const AI_API_BASE = process.env.AI_API_BASE || ""; // e.g. https://ai.t8star.cn/v1
+const AI_API_KEY = process.env.AI_API_KEY || "";
+const AI_MODEL = process.env.AI_MODEL || "grok-4.1";
+const AI_ANALYSIS_PROMPT = process.env.AI_ANALYSIS_PROMPT || "Describe this image in detail, including subject, style, lighting, composition, and mood.";
+
 const TG_API = BOT_TOKEN ? `https://api.telegram.org/bot${BOT_TOKEN}` : null;
 
 // -------- Utils ----------
@@ -132,6 +138,47 @@ async function tgSendFullContent(chatId, fullCaption, useHTML = true) {
   }
 
   return results;
+}
+
+// -------- AI 图像分析 ----------
+async function analyzeImageWithAI(imageUrl) {
+  if (!AI_API_BASE || !AI_API_KEY) {
+    console.log("[AI] Skipped: AI_API_BASE or AI_API_KEY not configured");
+    return null;
+  }
+  try {
+    console.log(`[AI] Analyzing image: ${imageUrl.slice(0, 80)}...`);
+    const resp = await axios.post(
+      `${AI_API_BASE}/chat/completions`,
+      {
+        model: AI_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: AI_ANALYSIS_PROMPT },
+              { type: "image_url", image_url: { url: imageUrl } },
+            ],
+          },
+        ],
+        max_tokens: 2000,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${AI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 120000,
+      }
+    );
+    const result = resp.data?.choices?.[0]?.message?.content || null;
+    const tokens = resp.data?.usage?.total_tokens || 0;
+    console.log(`[AI] Done, tokens=${tokens}, result_len=${(result || "").length}`);
+    return result;
+  } catch (e) {
+    console.error(`[AI] Analysis failed: ${tgErrInfo(e)}`);
+    return null;
+  }
 }
 
 function routeChatBySource(source = "") {
@@ -546,6 +593,23 @@ app.post("/api/send", async (req, res) => {
       : tagCaption;                         // 其他: 仅 tag
 
     const routedResults = await sendMediaWithLongCaption(routedChat, groups, captionRouted);
+
+    // 3) AI 图像分析：取第一张图片进行分析，结果追加到主频道
+    let aiResult = null;
+    if (AI_API_BASE && AI_API_KEY) {
+      const firstImage = files.find((f) => f && f.url && mediaToKind(f) !== "video");
+      if (firstImage) {
+        aiResult = await analyzeImageWithAI(firstImage.url);
+        if (aiResult) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const aiCaption = `<b>🔍 AI Analysis</b>\n\n${escHtml(aiResult)}`;
+          await tgSendFullContent(CHAT_ID_MAIN, aiCaption, true);
+          console.log(`[AI] Analysis sent to main channel, len=${aiResult.length}`);
+        }
+      } else {
+        console.log("[AI] No image file found for analysis, skipped.");
+      }
+    }
 
     const ms = Date.now() - t0;
     console.log(
