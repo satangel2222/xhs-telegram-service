@@ -59,7 +59,9 @@ function buildCaptionHTML({ title, author, noteUrl, pageUrl, source }) {
   const t = escHtml((title || "").trim() || "媒体");
   const a = escHtml((author || "").trim() || (source || "unknown"));
   const link = escHtml(noteUrl || pageUrl || "");
-  let cap = `<b>${t}</b>`;
+  // For very long titles (>1000 chars), don't wrap in <b> to avoid HTML split issues
+  // when text is chunked for Telegram's 4096 char limit
+  let cap = t.length > 1000 ? t : `<b>${t}</b>`;
   cap += `\n\n<b>作者：</b>${a}`;
   if (link) cap += `\n<b>来源：</b><a href="${link}">点击查看</a>`;
   return cap;
